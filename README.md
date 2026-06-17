@@ -1,5 +1,5 @@
 The starting point and ending point of the SOBP：
-StartPoint = 1
+StartPoint = 1，
 EndPoint = 2.09
 
  Spread out bragg peak for tumor in heavy ion therapy.
