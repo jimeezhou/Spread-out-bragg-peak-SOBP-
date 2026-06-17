@@ -1,4 +1,4 @@
- Spread out bragg peak for tumor in heavy ion therapy.
+ Spread out bragg peak for tumor in heavy ion or proton therapy.
 
 The starting point and ending point of the SOBP：
 StartPoint = 1，
