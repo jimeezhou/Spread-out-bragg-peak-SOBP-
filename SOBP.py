@@ -10,6 +10,7 @@ from matplotlib.animation import FuncAnimation
 import json
 import os
 import time
+import io
 import streamlit.components.v1 as components
 import tempfile
 
@@ -399,7 +400,19 @@ with tab_preview:
 # ---- Tab 1: Optimization Results ----
 with tab_opt:
     # Optimization results content
-    run_btn_tab = st.button("▶ Run Optimization", type="primary", key="run_btn_tab", use_container_width=True)
+    st.markdown("""
+    <style>
+        div[data-testid="stButton"][data-key="run_btn_tab"] > button {
+            width: auto !important;
+            min-width: unset !important;
+            display: inline-block !important;
+            margin-left: 0 !important;
+            padding-left: 0.75rem !important;
+            padding-right: 0.75rem !important;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    run_btn_tab = st.button("▶ Run Optimization", type="primary", key="run_btn_tab")
 
     if run_btn or run_btn_tab:
         with st.spinner("Optimizing SOBP parameters... This may take a moment."):
@@ -489,8 +502,11 @@ with tab_opt:
         st.pyplot(fig4)
         plt.close(fig4)
 
-        # Figure 5: Quarter-Circle Distance vs Time (0 ~ 2π, 2 cycles)
-        fig5, ax5 = plt.subplots(figsize=(10, 5))
+        # Combined Figure: Left=Distance vs Time, Right=3D Annular Pie
+        fig_combined = plt.figure(figsize=(18, 8))
+
+        # Left: Quarter-Circle Distance vs Time (0 ~ 2π, 2 cycles)
+        ax5 = fig_combined.add_subplot(121)
 
         d_actual = np.cumsum(bragg.Velocity(para, t_arr)) * res['step']
         D_max = float(np.max(d_actual))
@@ -533,13 +549,9 @@ with tab_opt:
         ax5.set_title("Quarter-Circle Distance vs Time (2 cycles in 2π)", fontsize=13, fontweight='bold')
         ax5.legend(fontsize=10)
         ax5.grid(True, alpha=0.3)
-        fig5.tight_layout()
-        st.pyplot(fig5)
-        plt.close(fig5)
 
-        # Figure 6: 3D Annular Pie
-        fig6 = plt.figure(figsize=(10, 8))
-        ax6 = fig6.add_subplot(111, projection='3d')
+        # Right: 3D Annular Pie
+        ax6 = fig_combined.add_subplot(122, projection='3d')
 
         r_inner = 5.0
         r_outer = 10.0
@@ -594,9 +606,9 @@ with tab_opt:
         ax6.set_title("3D Annular Pie — Height Variation (2 cycles)\n(Inner ⌀=5cm, Outer ⌀=10cm)",
                        fontsize=13, fontweight='bold', pad=10)
         ax6.view_init(elev=30, azim=-60)
-        fig6.tight_layout()
-        st.pyplot(fig6)
-        plt.close(fig6)
+        fig_combined.tight_layout()
+        st.pyplot(fig_combined)
+        plt.close(fig_combined)
 
         # Platform flatness analysis
         platform_bio = bio_spread[(InterDistance > sp) & (InterDistance < ep)]
@@ -622,11 +634,13 @@ with tab_opt:
                 'BiologyDose_SOBP': bio_spread,
                 'PhysicalDose_SOBP': phys_spread,
             })
+            buf = io.BytesIO()
+            result_df.to_excel(buf, index=False, engine='openpyxl')
             st.download_button(
-                "📥 Download SOBP Data (CSV)",
-                result_df.to_csv(index=False),
-                file_name="SOBP_results.csv",
-                mime="text/csv",
+                "📥 Download SOBP Data (Excel)",
+                buf.getvalue(),
+                file_name="SOBP_results.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
         with dl_cols[1]:
@@ -635,6 +649,21 @@ with tab_opt:
                 f"Optimized para: {para.tolist()}\nStartPoint: {sp}\nEndPoint: {ep}\nStep: {res['step']}",
                 file_name="SOBP_parameters.txt",
                 mime="text/plain",
+                use_container_width=True,
+            )
+        with dl_cols[2]:
+            qc_df = pd.DataFrame({
+                'Time_rad': x,
+                'QuarterCircle_Ideal_cm': d_qc,
+                'Optimized_Distance_cm': np.interp(x, t_arr * 2 * np.pi, d_actual),
+            })
+            buf2 = io.BytesIO()
+            qc_df.to_excel(buf2, index=False, engine='openpyxl')
+            st.download_button(
+                "📥 Download Quarter-Circle Distance (Excel)",
+                buf2.getvalue(),
+                file_name="quarter_circle_distance.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
     else:
@@ -910,7 +939,7 @@ with tab_sim:
                     ax7.view_init(elev=25, azim=-120)
 
                     fpath = os.path.join(tmp_dir_anim, f'frame_{frame:03d}.png')
-                    fig7.savefig(fpath, dpi=80, bbox_inches='tight')
+                    fig7.savefig(fpath, dpi=120, bbox_inches='tight')
                     gif_frames.append(fpath)
 
                 plt.close(fig7)
@@ -938,6 +967,30 @@ with tab_sim:
                     file_name="SOBP_simulation.gif",
                     mime="image/gif",
                 )
+
+                # Convert GIF to MP4 video using ffmpeg
+                mp4_path = os.path.join(tmp_dir_anim, 'sobp_simulation.mp4')
+                try:
+                    import subprocess
+                    fps = max(1, round(1000.0 / 120))  # duration=120ms per frame → ~8fps
+                    vf_filter = f'fps={fps},scale=trunc(iw/2)*2:trunc(ih/2)*2'
+                    result = subprocess.run(
+                        ['ffmpeg', '-y', '-i', gif_path, '-vf', vf_filter, '-pix_fmt', 'yuv420p', '-movflags', '+faststart', mp4_path],
+                        capture_output=True, timeout=60
+                    )
+                    if result.returncode == 0 and os.path.exists(mp4_path):
+                        with open(mp4_path, 'rb') as vf:
+                            mp4_bytes = vf.read()
+                        st.download_button(
+                            "🎬 Download Animation (MP4 Video)",
+                            mp4_bytes,
+                            file_name="SOBP_simulation.mp4",
+                            mime="video/mp4",
+                        )
+                    else:
+                        st.caption(f"(MP4 conversion failed: rc={result.returncode}, err={result.stderr.decode()[:200]})")
+                except Exception as e:
+                    st.caption(f"(MP4 conversion error: {e})")
 
                 import shutil
                 shutil.rmtree(tmp_dir_anim, ignore_errors=True)
