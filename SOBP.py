@@ -329,13 +329,15 @@ with st.sidebar:
     bp_df = st.session_state.bragg_df
     depth_min = float(bp_df.iloc[:, 0].min())
     depth_max = float(bp_df.iloc[:, 0].max())
+    # Ensure input bounds are wide enough for default values (12.0, 14.45)
+    input_max = max(depth_max, 20.0)
 
     col_sp1, col_sp2 = st.columns(2)
     with col_sp1:
         start_point = st.number_input(
             "StartPoint (cm)",
             min_value=0.0,
-            max_value=depth_max,
+            max_value=input_max,
             value=12.0,
             step=0.01,
             format="%.2f",
@@ -344,7 +346,7 @@ with st.sidebar:
         end_point = st.number_input(
             "EndPoint (cm)",
             min_value=start_point + 0.01,
-            max_value=depth_max,
+            max_value=input_max,
             value=14.45,
             step=0.01,
             format="%.2f",
@@ -1327,6 +1329,20 @@ with tab_sim:
 # ---- Tab 3: Help ----
 with tab_help:
     # Help content
+
+    with st.expander("📥 Download & Local Use / 下载到本地运行", expanded=True):
+        st.markdown("""
+        **English**: The web version has limited computing power. Please download the code to your local machine for better performance.
+
+        **中文**: 网页版算力不够，请下载到本地使用。
+
+        **GitHub Repository**: [https://github.com/jimeezhou/Spread-out-bragg-peak-SOBP-/tree/SOBP](https://github.com/jimeezhou/Spread-out-bragg-peak-SOBP-/tree/SOBP)
+
+        Click the green **"Code"** button on GitHub, then select **"Download ZIP"**, or clone with:
+        ```bash
+        git clone -b SOBP https://github.com/jimeezhou/Spread-out-bragg-peak-SOBP-.git
+        ```
+        """)
 
     with st.expander("1. What is SOBP?", expanded=True):
         st.markdown("""
