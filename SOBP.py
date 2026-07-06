@@ -2,7 +2,7 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline
-from scipy.optimize import fmin
+from scipy.optimize import fmin, differential_evolution
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -79,11 +79,12 @@ st.markdown("""
 # Bragg Class (from original code)
 # ============================================================
 class Bragg:
-    def __init__(self, Depth, Pristine, LET, RBE, T, step, StartPoint, EndPoint):
+    def __init__(self, Depth, Dose, LET_profile, LET, RBE, T, step, StartPoint, EndPoint):
         self.Depth = Depth
-        self.Pristine = Pristine
-        self.LET = LET
-        self.RBE = RBE
+        self.Dose = Dose              # Physical dose vs depth
+        self.LET_profile = LET_profile  # LET vs depth (for RBE lookup)
+        self.LET = LET                # LET axis for RBE table
+        self.RBE = RBE                # RBE values from table
         self.T = T
         self.step = step
         self.StartPoint = StartPoint
@@ -94,45 +95,123 @@ class Bragg:
         return t
 
     def Velocity(self, para, t):
-        vt = para[0]*t**4 + para[1]*t**3 + para[2]*t**2 + para[3]*t + para[4]
+        vt = np.zeros_like(t, dtype=float)
+        for i, coeff in enumerate(para):
+            vt += coeff * t**i
         return vt
 
-    def BraggSpread(self, para):
+    def BraggSpread(self, para, region_only=False):
         t = self.Time()
         RBE_PP = CubicSpline(self.LET, self.RBE)
-        RBE_Data = RBE_PP(self.Pristine)
-        SpreadOut = np.zeros(len(self.Depth))
-        Distance = 0.0
-        for i in range(len(t)):
-            Distance = Distance + self.Velocity(para, self.step * i) * self.step
-            mask = self.Depth > Distance
-            n_valid = np.sum(mask)
-            BraggTemp = np.zeros(len(self.Pristine))
-            BraggTemp[:n_valid] = self.Pristine[mask]
-            RBETemp = np.zeros(len(RBE_Data))
-            RBETemp[:n_valid] = RBE_Data[mask]
-            SpreadOut = SpreadOut + BraggTemp * RBETemp * self.step
-        return SpreadOut
+        RBE_Data = RBE_PP(self.LET_profile)  # RBE from depth-LET profile
+
+        if region_only:
+            # Optimized: only compute within [StartPoint, EndPoint]
+            # Left-shift model: dose at depth z = Dose(z + Distance)
+            # Physical constraint: max Distance = EP - SP (peak cannot shift shallower than SP)
+            max_distance = self.EndPoint - self.StartPoint
+            region_mask = (self.Depth >= self.StartPoint) & (self.Depth <= self.EndPoint)
+            Depth_region = self.Depth[region_mask]
+            n_region = len(Depth_region)
+
+            SpreadOut = np.zeros(n_region)
+            Distance = 0.0
+            for i in range(len(t)):
+                # FIRST: add dose contribution at current Distance
+                shifted_depths = Depth_region + Distance
+                valid = (shifted_depths >= self.Depth[0]) & (shifted_depths <= self.Depth[-1])
+                if np.any(valid):
+                    Dose_shifted = np.interp(shifted_depths[valid], self.Depth, self.Dose)
+                    RBE_shifted = np.interp(shifted_depths[valid], self.Depth, RBE_Data)
+                    SpreadOut[valid] += Dose_shifted * RBE_shifted * self.step
+                # THEN: update Distance for next step
+                # Physical constraints: v >= 0 (no backward shift), Distance <= max_distance
+                v_step = self.Velocity(para, self.step * i) * self.step
+                Distance = min(Distance + max(v_step, 0.0), max_distance)
+            return SpreadOut, Depth_region
+        else:
+            # Full computation for display — left-shift model
+            # Physical constraint: max Distance = EP - SP
+            max_distance = self.EndPoint - self.StartPoint
+            SpreadOut = np.zeros(len(self.Depth))
+            Distance = 0.0
+            for i in range(len(t)):
+                # FIRST: add dose contribution at current Distance
+                shifted_depths = self.Depth + Distance
+                valid = (shifted_depths >= self.Depth[0]) & (shifted_depths <= self.Depth[-1])
+                if np.any(valid):
+                    Dose_shifted = np.interp(shifted_depths[valid], self.Depth, self.Dose)
+                    RBE_shifted = np.interp(shifted_depths[valid], self.Depth, RBE_Data)
+                    SpreadOut[valid] += Dose_shifted * RBE_shifted * self.step
+                # THEN: update Distance for next step
+                # Physical constraints: v >= 0 (no backward shift), Distance <= max_distance
+                v_step = self.Velocity(para, self.step * i) * self.step
+                Distance = min(Distance + max(v_step, 0.0), max_distance)
+            return SpreadOut
 
     def PhysicsBraggSpread(self, para):
         t = self.Time()
+        # Physical constraint: max Distance = EP - SP
+        max_distance = self.EndPoint - self.StartPoint
         PhySpreadOut = np.zeros(len(self.Depth))
         Distance = 0.0
         for i in range(len(t)):
-            Distance = Distance + self.Velocity(para, self.step * i) * self.step
-            mask = self.Depth > Distance
-            n_valid = np.sum(mask)
-            BraggTemp = np.zeros(len(self.Pristine))
-            BraggTemp[:n_valid] = self.Pristine[mask]
-            PhySpreadOut = PhySpreadOut + BraggTemp * self.step
+            # FIRST: add dose contribution at current Distance
+            shifted_depths = self.Depth + Distance
+            valid = (shifted_depths >= self.Depth[0]) & (shifted_depths <= self.Depth[-1])
+            if np.any(valid):
+                Dose_shifted = np.interp(shifted_depths[valid], self.Depth, self.Dose)
+                PhySpreadOut[valid] += Dose_shifted * self.step
+            # THEN: update Distance for next step
+            # Physical constraints: v >= 0 (no backward shift), Distance <= max_distance
+            v_step = self.Velocity(para, self.step * i) * self.step
+            Distance = min(Distance + max(v_step, 0.0), max_distance)
         return PhySpreadOut
 
+    def _region_dose(self, para):
+        """Compute biological dose in [StartPoint, EndPoint] only (for objective functions)."""
+        SpreadOut_region, _ = self.BraggSpread(para, region_only=True)
+        return SpreadOut_region
+
     def Standard_Deviation_of_BraggSpread(self, para):
-        SpreadOut = self.BraggSpread(para)
-        S1 = SpreadOut[(self.Depth > self.StartPoint) & (self.Depth < self.EndPoint)]
-        S2 = SpreadOut[self.Depth < self.EndPoint]
-        Stddev = np.std(S1) - np.std(S2)
-        return Stddev
+        S1 = self._region_dose(para)
+        return np.std(S1)
+
+    def CV_of_BraggSpread(self, para):
+        """Coefficient of Variation: std/mean * 100%"""
+        S1 = self._region_dose(para)
+        mu = np.mean(S1)
+        return np.std(S1) / mu if mu != 0 else 1e10
+
+    def DHI_of_BraggSpread(self, para):
+        """Dose Homogeneity Index: (D_max - D_min) / D_mean — clinical standard"""
+        S1 = self._region_dose(para)
+        mu = np.mean(S1)
+        return (np.max(S1) - np.min(S1)) / mu if mu != 0 else 1e10
+
+    def MaxRelDev_of_BraggSpread(self, para):
+        """Maximum Relative Deviation: max|dose - mean| / mean — penalizes outliers"""
+        S1 = self._region_dose(para)
+        mu = np.mean(S1)
+        return np.max(np.abs(S1 - mu)) / mu if mu != 0 else 1e10
+
+    def PercentileUniformity_of_BraggSpread(self, para):
+        """Percentile Uniformity: (D_2 - D_98) / D_50 — robust to outliers"""
+        S1 = self._region_dose(para)
+        d50 = np.median(S1)
+        d2 = np.percentile(S1, 2)
+        d98 = np.percentile(S1, 98)
+        return (d98 - d2) / d50 if d50 != 0 else 1e10
+
+    def Combined_of_BraggSpread(self, para):
+        """Combined: α·CV + β·DHI — balances overall uniformity and worst case"""
+        S1 = self._region_dose(para)
+        mu = np.mean(S1)
+        if mu == 0:
+            return 1e10
+        cv = np.std(S1) / mu
+        dhi = (np.max(S1) - np.min(S1)) / mu
+        return 0.5 * cv + 0.5 * dhi
 
 # ============================================================
 # Load demo data
@@ -195,7 +274,7 @@ with st.sidebar:
             "Upload BraggPeak",
             type=["xlsx", "xls", "csv"],
             key="bragg_uploader",
-            help="Excel/CSV with columns: depth, Pristine",
+            help="Excel/CSV with columns: Depth, Dose, LET (3-col) or Depth, Dose (2-col legacy)",
         )
         rbe_file = st.file_uploader(
             "Upload RBE (Relative Biological Effectiveness)",
@@ -232,16 +311,16 @@ with st.sidebar:
         st.session_state.data_loaded = True
         st.info("Using built-in demo data.")
 
-    # --- Part 1 continued: Interpolation Step ---
-    st.markdown('<div class="sidebar-section"><b>⚙️ Interpolation Step</b></div>', unsafe_allow_html=True)
-    step = st.number_input(
+    # --- Part 1 continued: Optimization Step (customizable) ---
+    st.markdown('<div class="sidebar-section"><b>⚙️ Optimization Step</b></div>', unsafe_allow_html=True)
+    opt_step = st.number_input(
         "Step (cm)",
         min_value=0.0001,
         max_value=0.1,
-        value=0.001,
+        value=0.01,
         step=0.0001,
         format="%.4f",
-        help="Interpolation step for densifying discrete data. Smaller = finer resolution but slower.",
+        help="Interpolation step used during optimization. Smaller = more accurate but slower. Output plots always use step=0.001.",
     )
 
     # --- Part 2: Spread Width ---
@@ -257,7 +336,7 @@ with st.sidebar:
             "StartPoint (cm)",
             min_value=0.0,
             max_value=depth_max,
-            value=1.0,
+            value=12.0,
             step=0.01,
             format="%.2f",
         )
@@ -266,18 +345,88 @@ with st.sidebar:
             "EndPoint (cm)",
             min_value=start_point + 0.01,
             max_value=depth_max,
-            value=2.09,
+            value=14.45,
             step=0.01,
             format="%.2f",
         )
 
-    # --- Part 3: Run ---
-    st.markdown('<div class="sidebar-section"><b>🚀 3. Run Optimization</b></div>', unsafe_allow_html=True)
+    # --- Part 3: Polynomial Degree ---
+    st.markdown('<div class="sidebar-section"><b>🔢 3. Polynomial Degree</b></div>', unsafe_allow_html=True)
+    def _on_poly_degree_change():
+        """Clear results when polynomial degree changes so user must re-run."""
+        if 'results' in st.session_state and st.session_state.results is not None:
+            old_deg = st.session_state.results.get('poly_degree', 6)
+            new_deg = st.session_state.poly_degree
+            if old_deg != new_deg:
+                st.session_state.results = None
+                st.session_state.sim_generated = False
+
+    poly_degree = st.selectbox(
+        "Velocity Function Degree",
+        [1, 2, 3, 4, 5, 6],
+        index=5,
+        key="poly_degree",
+        on_change=_on_poly_degree_change,
+        help="Choose the polynomial degree for the velocity function v(t) = Σ aᵢ·tⁱ. Higher degrees offer more flexibility but may overfit.",
+    )
+
+    # --- Part 4: Objective Function ---
+    st.markdown('<div class="sidebar-section"><b>🎯 4. Objective Function</b></div>', unsafe_allow_html=True)
+
+    OBJECTIVE_FUNCS = {
+        'Standard Deviation (σ)': 'Std',
+        'Coefficient of Variation (CV)': 'CV',
+        'Dose Homogeneity Index (DHI)': 'DHI',
+        'Max Relative Deviation': 'MaxRelDev',
+        'Percentile Uniformity (D₂₋D₉₈)/D₅₀': 'Percentile',
+        'Combined (0.5·CV + 0.5·DHI)': 'Combined',
+    }
+
+    def _on_objective_change():
+        if 'results' in st.session_state and st.session_state.results is not None:
+            st.session_state.results = None
+            st.session_state.sim_generated = False
+
+    objective_choice = st.selectbox(
+        "Objective Function",
+        list(OBJECTIVE_FUNCS.keys()),
+        index=0,
+        key="objective_func",
+        on_change=_on_objective_change,
+        help="Choose the objective function to minimize in the platform region [StartPoint, EndPoint].",
+    )
+
+    # --- Part 5: Optimization Strategy ---
+    st.markdown('<div class="sidebar-section"><b>⚡ 5. Optimization Strategy</b></div>', unsafe_allow_html=True)
+
+    OPT_STRATEGIES = {
+        'Nelder-Mead (fast)': 'nelder_mead',
+        'Multi-Start Restart': 'multi_start',
+        'Differential Evolution (global)': 'diff_evo',
+        'Two-Stage (global → local)': 'two_stage',
+    }
+
+    def _on_strategy_change():
+        if 'results' in st.session_state and st.session_state.results is not None:
+            st.session_state.results = None
+            st.session_state.sim_generated = False
+
+    opt_strategy = st.selectbox(
+        "Strategy",
+        list(OPT_STRATEGIES.keys()),
+        index=0,
+        key="opt_strategy",
+        on_change=_on_strategy_change,
+        help="Nelder-Mead: fast local search. Multi-Start: multiple random restarts. Differential Evolution: global search. Two-Stage: global then local refinement.",
+    )
+
+    # --- Part 6: Run ---
+    st.markdown('<div class="sidebar-section"><b>🚀 6. Run Optimization</b></div>', unsafe_allow_html=True)
     n_iter = st.number_input(
         "Optimization Iterations",
         min_value=1,
         max_value=20,
-        value=1,
+        value=4,
         step=1,
         help="Number of fmin optimization rounds. More = better fit but slower.",
     )
@@ -299,7 +448,16 @@ rbe_df = st.session_state.rbe_df
 
 # Parse BraggPeak data
 depth = bp_df.iloc[:, 0].values.astype(float)
-pristine = bp_df.iloc[:, 1].values.astype(float)
+
+if bp_df.shape[1] >= 3:
+    # 3-column format: Depth, Dose, LET
+    dose_raw = bp_df.iloc[:, 1].values.astype(float)
+    let_profile_raw = bp_df.iloc[:, 2].values.astype(float)
+elif bp_df.shape[1] == 2:
+    # Legacy 2-column format: Depth, Pristine (treated as LET)
+    dose_raw = bp_df.iloc[:, 1].values.astype(float)
+    let_profile_raw = dose_raw.copy()  # fallback: same as dose
+    st.caption("Note: 2-column BraggPeak format detected. LET profile assumed equal to Dose. For accurate biological dose, use 3-column format (Depth, Dose, LET).")
 
 # Parse RBE data (skip header row if present)
 if rbe_df.iloc[0, 0] in ['Kev/um', 'LET', 'LET/Kev']:
@@ -309,10 +467,11 @@ else:
 let = rbe_clean.iloc[:, 0].values
 rbe = rbe_clean.iloc[:, 1].values
 
-# Interpolation
-InterDistance = np.arange(0, depth.max() + step, step)
-PP = CubicSpline(depth, pristine)
-PristinePP = PP(InterDistance)
+# Interpolation — always at fine step (0.001) for output resolution
+PLOT_STEP = 0.001
+InterDistance = np.arange(0, depth.max() + PLOT_STEP, PLOT_STEP)
+DosePP = CubicSpline(depth, dose_raw)(InterDistance)
+LetProfilePP = CubicSpline(depth, let_profile_raw)(InterDistance)
 
 # ============================================================
 # Tabbed Content: Data Preview / Optimization / Simulation / Help
@@ -341,10 +500,18 @@ with tab_preview:
     with col_data1:
         st.markdown("**BraggPeak Data**")
         fig_bp, ax_bp = plt.subplots(figsize=(6, 3.5))
-        ax_bp.plot(depth, pristine, 'b-', linewidth=1.5)
+        ax_bp2 = ax_bp.twinx()
+        ax_bp.plot(depth, dose_raw, 'b-', linewidth=1.5, label='Physical Dose')
+        ax_bp2.plot(depth, let_profile_raw, 'r-', linewidth=1.5, alpha=0.7, label='LET')
         ax_bp.set_xlabel("Depth / cm", fontsize=10)
-        ax_bp.set_ylabel("Pristine", fontsize=10)
-        ax_bp.set_title("Bragg Peak", fontsize=11, fontweight='bold')
+        ax_bp.set_ylabel("Physical Dose (relative)", fontsize=10, color='blue')
+        ax_bp2.set_ylabel("LET / keV·μm⁻¹", fontsize=10, color='red')
+        ax_bp.set_title("Bragg Peak: Dose & LET vs Depth", fontsize=11, fontweight='bold')
+        ax_bp.tick_params(axis='y', labelcolor='blue')
+        ax_bp2.tick_params(axis='y', labelcolor='red')
+        lines1, labels1 = ax_bp.get_legend_handles_labels()
+        lines2, labels2 = ax_bp2.get_legend_handles_labels()
+        ax_bp.legend(lines1 + lines2, labels1 + labels2, fontsize=9, loc='upper left')
         ax_bp.grid(True, alpha=0.3)
         fig_bp.tight_layout()
         st.pyplot(fig_bp)
@@ -370,7 +537,7 @@ with tab_preview:
 
     # Interpolation info
     st.markdown(
-        f"**Interpolation:** Step = {step} cm → "
+        f"**Interpolation:** Plot step = {PLOT_STEP} cm, Optimization step = {opt_step} cm → "
         f"Original {len(depth)} points → Interpolated {len(InterDistance)} points  |  "
         f"Depth range: [{depth.min():.2f}, {depth.max():.2f}] cm"
     )
@@ -382,16 +549,23 @@ with tab_preview:
         f"(width = **{end_point - start_point:.2f} cm**)"
     )
 
-    # Highlight the spread region on the pristine curve
+    # Highlight the spread region on the dose curve
     fig_spread_region, ax_sr = plt.subplots(figsize=(8, 3.5))
-    ax_sr.plot(InterDistance, PristinePP, 'b-', linewidth=1.5, label='Pristine')
+    ax_sr2 = ax_sr.twinx()
+    ax_sr.plot(InterDistance, DosePP, 'b-', linewidth=1.5, label='Physical Dose')
+    ax_sr2.plot(InterDistance, LetProfilePP, 'r-', linewidth=1.5, alpha=0.7, label='LET')
     ax_sr.axvspan(start_point, end_point, alpha=0.2, color='orange', label=f'Spread Region [{start_point:.2f}, {end_point:.2f}]')
     ax_sr.axvline(start_point, color='orange', linestyle='--', linewidth=1)
     ax_sr.axvline(end_point, color='orange', linestyle='--', linewidth=1)
     ax_sr.set_xlabel("Depth / cm", fontsize=10)
-    ax_sr.set_ylabel("Pristine", fontsize=10)
-    ax_sr.set_title("Pristine Peak with Spread Region", fontsize=11, fontweight='bold')
-    ax_sr.legend(fontsize=9)
+    ax_sr.set_ylabel("Physical Dose (relative)", fontsize=10, color='blue')
+    ax_sr2.set_ylabel("LET / keV·μm⁻¹", fontsize=10, color='red')
+    ax_sr.set_title("Dose & LET with Spread Region", fontsize=11, fontweight='bold')
+    lines1, labels1 = ax_sr.get_legend_handles_labels()
+    lines2, labels2 = ax_sr2.get_legend_handles_labels()
+    ax_sr.legend(lines1 + lines2, labels1 + labels2, fontsize=9, loc='upper left')
+    ax_sr.tick_params(axis='y', labelcolor='blue')
+    ax_sr2.tick_params(axis='y', labelcolor='red')
     ax_sr.grid(True, alpha=0.3)
     fig_spread_region.tight_layout()
     st.pyplot(fig_spread_region)
@@ -418,31 +592,130 @@ with tab_opt:
         with st.spinner("Optimizing SOBP parameters... This may take a moment."):
             progress = st.progress(0, text="Initializing optimization...")
 
-            bragg = Bragg(InterDistance, PristinePP, let, rbe, 1, step, start_point, end_point)
+            # Optimization uses user-specified step (can be coarser for speed)
+            bragg = Bragg(InterDistance, DosePP, LetProfilePP, let, rbe, 1, opt_step, start_point, end_point)
 
-            para = np.array([-0.2883, 0.1038, 1.3617, 1.7013, -0.0056])
+            # Get polynomial degree from session state (stored by sidebar selectbox)
+            poly_degree = st.session_state.get('poly_degree', 6)
 
-            for i in range(n_iter):
-                progress.progress(int((i + 1) / n_iter * 60), text=f"Optimization round {i+1}/{n_iter}...")
-                para = fmin(bragg.Standard_Deviation_of_BraggSpread, para, disp=False)
+            # Get objective function from session state
+            obj_key = st.session_state.get('objective_func', 'Standard Deviation (σ)')
+            OBJ_MAP = {
+                'Standard Deviation (σ)': bragg.Standard_Deviation_of_BraggSpread,
+                'Coefficient of Variation (CV)': bragg.CV_of_BraggSpread,
+                'Dose Homogeneity Index (DHI)': bragg.DHI_of_BraggSpread,
+                'Max Relative Deviation': bragg.MaxRelDev_of_BraggSpread,
+                'Percentile Uniformity (D₂₋D₉₈)/D₅₀': bragg.PercentileUniformity_of_BraggSpread,
+                'Combined (0.5·CV + 0.5·DHI)': bragg.Combined_of_BraggSpread,
+            }
+            obj_func = OBJ_MAP.get(obj_key, bragg.Standard_Deviation_of_BraggSpread)
 
-            progress.progress(70, text="Computing spread profiles...")
+            # Get optimization strategy
+            strategy_key = st.session_state.get('opt_strategy', 'Nelder-Mead (fast)')
+            strategy = OPT_STRATEGIES.get(strategy_key, 'nelder_mead')
 
-            bio_spread = bragg.BraggSpread(para)
-            phys_spread = bragg.PhysicsBraggSpread(para)
+            # Parameter bounds for constrained optimization
+            # Each a_i in [-10, 10] — wide enough for search, prevents wild values
+            n_para = poly_degree + 1
+            bounds = [(-10.0, 10.0)] * n_para
+
+            # Initial parameters based on degree
+            if poly_degree == 1:
+                para = np.array([1.0, 0.0])
+            elif poly_degree == 2:
+                para = np.array([0.5, -0.5, 0.0])
+            elif poly_degree == 3:
+                para = np.array([0.3, 0.5, -0.3, 0.0])
+            elif poly_degree == 4:
+                para = np.array([-0.2883, 0.1038, 1.3617, 1.7013, -0.0056])
+            elif poly_degree == 5:
+                para = np.array([0.1, -0.2, 0.5, 1.0, 0.0, 0.0])
+            elif poly_degree == 6:
+                para = np.array([0.05, -0.1, 0.2, 0.5, 1.0, 0.0, 0.0])
+            else:
+                para = np.array([-0.2883, 0.1038, 1.3617, 1.7013, -0.0056])
+
+            if strategy == 'nelder_mead':
+                # Classic local search (fastest)
+                for i in range(n_iter):
+                    progress.progress(int((i + 1) / n_iter * 60), text=f"Nelder-Mead round {i+1}/{n_iter}...")
+                    para = fmin(obj_func, para, disp=False)
+
+            elif strategy == 'multi_start':
+                # Multiple random restarts — run Nelder-Mead from several initial points
+                n_starts = max(3, n_iter * 2)
+                best_para = para.copy()
+                best_val = obj_func(para)
+                for s in range(n_starts):
+                    progress.progress(int((s + 1) / n_starts * 60),
+                                      text=f"Multi-start {s+1}/{n_starts} (best={best_val:.6f})...")
+                    if s == 0:
+                        x0 = para  # first start from default
+                    else:
+                        x0 = np.random.uniform(-2.0, 2.0, n_para)
+                    x_opt = fmin(obj_func, x0, disp=False, maxiter=2000)
+                    val = obj_func(x_opt)
+                    if val < best_val:
+                        best_val = val
+                        best_para = x_opt.copy()
+                para = best_para
+
+            elif strategy == 'diff_evo':
+                # Differential Evolution — global optimizer with bounds
+                progress.progress(10, text="Running Differential Evolution (global search)...")
+                result_de = differential_evolution(
+                    obj_func, bounds,
+                    maxiter=200, popsize=15, tol=1e-8,
+                    seed=42, mutation=(0.5, 1.0), recombination=0.7,
+                    polish=False,
+                )
+                para = result_de.x
+                progress.progress(60, text=f"DE converged: f={result_de.fun:.6f}")
+
+            elif strategy == 'two_stage':
+                # Stage 1: Differential Evolution (global search)
+                progress.progress(5, text="Stage 1/2: Differential Evolution (global)...")
+                result_de = differential_evolution(
+                    obj_func, bounds,
+                    maxiter=150, popsize=12, tol=1e-6,
+                    seed=42, mutation=(0.5, 1.0), recombination=0.7,
+                    polish=False,
+                )
+                para = result_de.x
+                progress.progress(40, text=f"Stage 1 done: f={result_de.fun:.6f}")
+
+                # Stage 2: Nelder-Mead refinement (local polish)
+                progress.progress(45, text="Stage 2/2: Nelder-Mead refinement...")
+                for i in range(max(n_iter, 3)):
+                    progress.progress(45 + int((i + 1) / max(n_iter, 3) * 20),
+                                      text=f"Stage 2: Nelder-Mead round {i+1}/{max(n_iter, 3)}...")
+                    para = fmin(obj_func, para, disp=False, maxiter=5000)
+                progress.progress(60, text="Two-stage optimization complete.")
+
+            progress.progress(70, text="Computing spread profiles (fine step)...")
+
+            # Recompute with fine step for output plots
+            bragg_fine = Bragg(InterDistance, DosePP, LetProfilePP, let, rbe, 1, PLOT_STEP, start_point, end_point)
+            bio_spread = bragg_fine.BraggSpread(para, region_only=False)
+            phys_spread = bragg_fine.PhysicsBraggSpread(para)
 
             progress.progress(100, text="Done!")
             time.sleep(0.3)
             progress.empty()
 
-            # Store results
+            # Store results (include InterDistance so plots match even if step changes)
             st.session_state.results = {
                 'para': para.tolist(),
+                'poly_degree': poly_degree,
+                'objective_func': obj_key,
+                'opt_strategy': strategy_key,
                 'bio_spread': bio_spread.tolist(),
                 'phys_spread': phys_spread.tolist(),
                 'start_point': start_point,
                 'end_point': end_point,
-                'step': step,
+                'step': PLOT_STEP,
+                'opt_step': opt_step,
+                'InterDistance': InterDistance.tolist(),
             }
 
     # Display results if available
@@ -453,21 +726,49 @@ with tab_opt:
         phys_spread = np.array(res['phys_spread'])
         sp = res['start_point']
         ep = res['end_point']
+        # Use the InterDistance from when optimization was run (may differ from current)
+        opt_distance = np.array(res.get('InterDistance', InterDistance))
 
         # Optimized parameters
+        poly_degree = res.get('poly_degree', 6)
+        obj_name = res.get('objective_func', 'Standard Deviation (σ)')
+        strategy_name = res.get('opt_strategy', 'Nelder-Mead (fast)')
         st.markdown('<div class="result-box">', unsafe_allow_html=True)
-        st.markdown("**Optimized Velocity Parameters:**")
-        para_cols = st.columns(5)
-        labels = ['a₀ (t⁴)', 'a₁ (t³)', 'a₂ (t²)', 'a₃ (t)', 'a₄ (const)']
+        st.markdown(f"""**Optimized Velocity Parameters (Degree = {poly_degree}, Objective = {obj_name}, Strategy = {strategy_name})**
+
+        Velocity function: v(t) = a₀ + a₁·t + a₂·t² + ... + a{poly_degree}·t^{poly_degree}""")
+        
+        # Generate labels dynamically based on degree
+        n_para = len(para)
+        labels = []
+        for i in range(n_para):
+            if i == 0:
+                labels.append('a₀ (const)')
+            elif i == 1:
+                labels.append('a₁ (t)')
+            elif i == 2:
+                labels.append('a₂ (t²)')
+            elif i == 3:
+                labels.append('a₃ (t³)')
+            elif i == 4:
+                labels.append('a₄ (t⁴)')
+            elif i == 5:
+                labels.append('a₅ (t⁵)')
+            elif i == 6:
+                labels.append('a₆ (t⁶)')
+            else:
+                labels.append(f'a{i} (t^{i})')
+        
+        para_cols = st.columns(min(n_para, 5))
         for j, (label, val) in enumerate(zip(labels, para)):
-            with para_cols[j]:
+            with para_cols[j % 5]:
                 st.metric(label, f"{val:.6f}")
         st.markdown('</div>', unsafe_allow_html=True)
 
         # Figure 3: SOBP curves
         fig3, ax3 = plt.subplots(figsize=(10, 5))
-        ax3.plot(InterDistance, bio_spread, 'r-', linewidth=2, label="Biology Dose (SOBP)")
-        ax3.plot(InterDistance, phys_spread, 'b-', linewidth=2, label="Physical Dose (SOBP)")
+        ax3.plot(opt_distance, bio_spread, 'r-', linewidth=2, label="Biology Dose (SOBP)")
+        ax3.plot(opt_distance, phys_spread, 'b-', linewidth=2, label="Physical Dose (SOBP)")
         ax3.axvspan(sp, ep, alpha=0.15, color='orange', label=f'Spread Region [{sp:.2f}, {ep:.2f}]')
         ax3.axvline(sp, color='orange', linestyle='--', linewidth=1)
         ax3.axvline(ep, color='orange', linestyle='--', linewidth=1)
@@ -481,7 +782,7 @@ with tab_opt:
         plt.close(fig3)
 
         # Figure 4: Velocity & Distance
-        bragg = Bragg(InterDistance, PristinePP, let, rbe, 1, res['step'], sp, ep)
+        bragg = Bragg(InterDistance, DosePP, LetProfilePP, let, rbe, 1, PLOT_STEP, sp, ep)
         t_arr = bragg.Time()
 
         fig4, axes4 = plt.subplots(1, 2, figsize=(12, 4.5))
@@ -492,7 +793,7 @@ with tab_opt:
         axes4[0].set_title("Velocity vs Time", fontsize=11, fontweight='bold')
         axes4[0].grid(True, alpha=0.3)
 
-        axes4[1].plot(t_arr, np.cumsum(bragg.Velocity(para, t_arr)) * res['step'], 'm-', linewidth=1.5)
+        axes4[1].plot(t_arr, np.cumsum(bragg.Velocity(para, t_arr)) * PLOT_STEP, 'm-', linewidth=1.5)
         axes4[1].set_xlabel("Time", fontsize=10)
         axes4[1].set_ylabel("Distance", fontsize=10)
         axes4[1].set_title("Distance vs Time", fontsize=11, fontweight='bold')
@@ -508,7 +809,10 @@ with tab_opt:
         # Left: Quarter-Circle Distance vs Time (0 ~ 2π, 2 cycles)
         ax5 = fig_combined.add_subplot(121)
 
-        d_actual = np.cumsum(bragg.Velocity(para, t_arr)) * res['step']
+        bragg = Bragg(InterDistance, DosePP, LetProfilePP, let, rbe, 1, PLOT_STEP, sp, ep)
+        t_arr = bragg.Time()
+
+        d_actual = np.cumsum(bragg.Velocity(para, t_arr)) * PLOT_STEP
         D_max = float(np.max(d_actual))
 
         n_pts = 4000
@@ -610,19 +914,37 @@ with tab_opt:
         st.pyplot(fig_combined)
         plt.close(fig_combined)
 
-        # Platform flatness analysis
-        platform_bio = bio_spread[(InterDistance > sp) & (InterDistance < ep)]
-        pre_platform_bio = bio_spread[InterDistance < sp]
-        if len(platform_bio) > 0 and len(pre_platform_bio) > 0:
+        # Platform flatness analysis — all 6 metrics
+        platform_bio = bio_spread[(opt_distance > sp) & (opt_distance < ep)]
+        if len(platform_bio) > 0:
+            mu = np.mean(platform_bio)
             st.markdown('<div class="result-box">', unsafe_allow_html=True)
-            flat_cols = st.columns(3)
-            with flat_cols[0]:
-                st.metric("Platform Std Dev", f"{np.std(platform_bio):.6f}")
-            with flat_cols[1]:
-                st.metric("Platform Mean Dose", f"{np.mean(platform_bio):.4f}")
-            with flat_cols[2]:
-                cv = np.std(platform_bio) / np.mean(platform_bio) * 100 if np.mean(platform_bio) != 0 else 0
-                st.metric("Platform CV (%)", f"{cv:.2f}%")
+            st.markdown("**Platform Uniformity Metrics**")
+
+            metric_cols1 = st.columns(3)
+            with metric_cols1[0]:
+                st.metric("Std Dev (σ)", f"{np.std(platform_bio):.6f}")
+            with metric_cols1[1]:
+                cv_val = np.std(platform_bio) / mu * 100 if mu != 0 else 0
+                st.metric("CV (%)", f"{cv_val:.2f}%")
+            with metric_cols1[2]:
+                dhi_val = (np.max(platform_bio) - np.min(platform_bio)) / mu if mu != 0 else 0
+                st.metric("DHI", f"{dhi_val:.4f}")
+
+            metric_cols2 = st.columns(3)
+            with metric_cols2[0]:
+                mrd_val = np.max(np.abs(platform_bio - mu)) / mu if mu != 0 else 0
+                st.metric("Max Rel Dev", f"{mrd_val:.4f}")
+            with metric_cols2[1]:
+                d2 = np.percentile(platform_bio, 2)
+                d98 = np.percentile(platform_bio, 98)
+                d50 = np.median(platform_bio)
+                pu_val = (d98 - d2) / d50 if d50 != 0 else 0
+                st.metric("Percentile Unif.", f"{pu_val:.4f}")
+            with metric_cols2[2]:
+                comb_val = 0.5 * (np.std(platform_bio) / mu) + 0.5 * dhi_val if mu != 0 else 0
+                st.metric("Combined", f"{comb_val:.4f}")
+
             st.markdown('</div>', unsafe_allow_html=True)
 
         # Download results
@@ -630,7 +952,7 @@ with tab_opt:
         dl_cols = st.columns(3)
         with dl_cols[0]:
             result_df = pd.DataFrame({
-                'Depth/cm': InterDistance,
+                'Depth/cm': opt_distance,
                 'BiologyDose_SOBP': bio_spread,
                 'PhysicalDose_SOBP': phys_spread,
             })
@@ -644,9 +966,10 @@ with tab_opt:
                 use_container_width=True,
             )
         with dl_cols[1]:
+            poly_degree = res.get('poly_degree', 6)
             st.download_button(
                 "📥 Download Parameters (TXT)",
-                f"Optimized para: {para.tolist()}\nStartPoint: {sp}\nEndPoint: {ep}\nStep: {res['step']}",
+                f"Polynomial Degree: {poly_degree}\nOptimized para: {para.tolist()}\nStartPoint: {sp}\nEndPoint: {ep}\nPlot Step: {PLOT_STEP}\nOpt Step: {res.get('opt_step', PLOT_STEP)}",
                 file_name="SOBP_parameters.txt",
                 mime="text/plain",
                 use_container_width=True,
@@ -662,7 +985,7 @@ with tab_opt:
             st.download_button(
                 "📥 Download Quarter-Circle Distance (Excel)",
                 buf2.getvalue(),
-                file_name="quarter_circle_distance.xlsx",
+                file_name=f"quarter_circle_distance_deg{poly_degree}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
@@ -689,9 +1012,9 @@ with tab_sim:
             with st.spinner("Generating radiation simulation..."):
                 sim_progress = st.progress(0, text="Preparing simulation...")
 
-                bragg = Bragg(InterDistance, PristinePP, let, rbe, 1, res['step'], sp, ep)
+                bragg = Bragg(InterDistance, DosePP, LetProfilePP, let, rbe, 1, PLOT_STEP, sp, ep)
                 t_arr = bragg.Time()
-                d_actual = np.cumsum(bragg.Velocity(para, t_arr)) * res['step']
+                d_actual = np.cumsum(bragg.Velocity(para, t_arr)) * PLOT_STEP
                 D_max = float(np.max(d_actual))
 
                 sim_progress.progress(10, text="Computing 3D geometry...")
@@ -704,7 +1027,10 @@ with tab_sim:
                 sobp_width = float(ep - sp)
                 beam_cyl_radius = 0.6
                 tumor_radius = beam_cyl_radius
-                gap_below_ring = 4.0
+                # Dynamic gap: tumor must always be clearly visible, never obscured by the ring
+                # Gap scales with both ring height (D_max) and tumor size (sobp_width)
+                min_gap = 10.0  # absolute minimum gap in cm
+                gap_below_ring = max(min_gap, D_max * 0.6, sobp_width * 1.5)
                 tumor_z_top = -gap_below_ring
                 tumor_z_bottom = tumor_z_top - sobp_width
                 bragg_peak_shallow = tumor_z_top
@@ -851,11 +1177,12 @@ with tab_sim:
                     ax7.plot_surface(beam_cx + tumor_x_irr, beam_cy + tumor_y_irr, tumor_z_irr,
                                      color='#E8A0A0', alpha=0.55, edgecolor='none', antialiased=True)
 
-                    # Bragg peak curve
+                    # Bragg peak curve (physical dose)
                     bp_x_offset = beam_cx + tumor_radius + 2.0
                     n_bp_pts = 50
                     bp_depth_arr = np.linspace(sp, ep, n_bp_pts)
-                    bp_dose_arr = PP(bp_depth_arr)
+                    bp_dose_spline = CubicSpline(depth, dose_raw)
+                    bp_dose_arr = bp_dose_spline(bp_depth_arr)
                     bp_dose_min = float(np.min(bp_dose_arr))
                     bp_dose_max = float(np.max(bp_dose_arr))
                     if bp_dose_max > bp_dose_min:
@@ -934,7 +1261,7 @@ with tab_sim:
                     ax7.set_ylabel("Y / cm", fontsize=8)
                     ax7.set_zlabel("Depth / cm", fontsize=8)
                     ax7.set_title(f"SOBP Radiation Simulation (Frame {frame+1}/{n_frames})\n"
-                                   f"Ring height: {h_at_beam:.2f} cm  |  Bragg peak depth: {bragg_depth:.2f} cm  |  Tumor: {sobp_width:.2f} cm",
+                                   f"Ring height: {h_at_beam:.2f} cm  |  Bragg peak: {bragg_depth:.2f} cm  |  Tumor: {sobp_width:.2f} cm  |  Gap: {gap_below_ring:.1f} cm",
                                    fontsize=9, fontweight='bold')
                     ax7.view_init(elev=25, azim=-120)
 
@@ -1012,7 +1339,7 @@ with tab_help:
         st.markdown("""
         **Step 1 — Load Data:** In the sidebar, choose "Demo Data" (built-in example) or "Upload Files" to provide your own BraggPeak and RBE data files.
 
-        **Step 2 — Set Interpolation Step:** Adjust the step size (default 0.001 cm). Smaller values give finer resolution but are slower.
+        **Step 2 — Set Optimization Step:** Adjust the step size (default 0.001 cm). Smaller values give finer optimization but are slower. Output plots always use step=0.001 for fine resolution.
 
         **Step 3 — Define Spread Width:** Set StartPoint and EndPoint (in cm) to define the SOBP plateau region.
 
@@ -1032,13 +1359,15 @@ with tab_help:
 
     with st.expander("3. Data Format"):
         st.markdown("""
-        **BraggPeak file** (xlsx/csv): Two columns — Depth (cm) and Pristine peak value.
+        **BraggPeak file** (xlsx/csv): Three columns — Depth (cm), Physical Dose (relative), LET (keV/μm).
 
-        | Depth/cm | Pristine |
-        |----------|----------|
-        | 0.00     | 0.001    |
-        | 0.01     | 0.002    |
-        | ...      | ...      |
+        | Depth/cm | Dose | LET (keV/μm) |
+        |----------|------|----------|
+        | 0.00     | 1.00 | 10.0     |
+        | 0.01     | 1.01 | 10.1     |
+        | ...      | ...  | ...      |
+
+        *Legacy 2-column format (Depth, Dose) is also supported — LET will be assumed equal to Dose.*
 
         **RBE file** (xlsx/csv): Two columns — LET (Kev/μm) and RBE value.
 
@@ -1049,15 +1378,100 @@ with tab_help:
         | ...     | ... |
         """)
 
-    with st.expander("4. Algorithm Details"):
-        st.markdown("""
-        The optimization uses a 4th-order polynomial velocity function:
+    with st.expander("4. Core Formulas & Algorithm"):
+        st.markdown(r"""
+        #### (a) Velocity Function
 
-        `v(t) = a₀t⁴ + a₁t³ + a₂t² + a₃t + a₄`
+        The beam energy modulation is controlled by a polynomial velocity function:
 
-        The cumulative distance determines which portion of the Bragg peak contributes at each time step. The objective function minimizes the standard deviation of the biological dose within the platform region [StartPoint, EndPoint].
+        $$v(t) = \sum_{i=0}^{n} a_i \cdot t^i = a_0 + a_1 t + a_2 t^2 + \cdots + a_n t^n$$
 
-        The quarter-circle distance model provides an idealized reference: the distance rises and falls following quarter-circle arcs, creating smooth, symmetric peaks — 2 cycles over [0, 2π].
+        where $n$ is the polynomial degree (selectable: 1–6), and $a_i$ are the optimization parameters.
+
+        **Physical constraint**: velocity must be non-negative at all times (the Bragg peak cannot shift deeper than EndPoint):
+
+        $$v(t) \geq 0 \quad \forall t$$
+
+        #### (b) Cumulative Distance (Range Shift)
+
+        At each time step $\Delta t$, the cumulative range shift is:
+
+        $$D_k = \sum_{j=0}^{k-1} v(t_j) \cdot \Delta t, \quad D_0 = 0$$
+
+        **Physical constraint**: the maximum range shift cannot exceed $z_{\text{end}} - z_{\text{start}}$, ensuring the shallowest Bragg peak does not move past StartPoint:
+
+        $$D_k \leq z_{\text{end}} - z_{\text{start}} \quad \forall k$$
+
+        #### (c) Biological SOBP Dose
+
+        At time step $k$ with cumulative shift $D_k$, the Bragg peak shifts **toward shallower depth**. The biological dose contribution at depth $z$ is:
+
+        $$\text{dose}_{\text{bio}}(z, t_k) = D_{\text{phys}}(z + D_k) \times \text{RBE}\bigl(\text{LET}(z + D_k)\bigr) \times \Delta t$$
+
+        The total biological SOBP is the sum over all time steps:
+
+        $$\text{SOBP}_{\text{bio}}(z) = \sum_{k=0}^{N} D_{\text{phys}}(z + D_k) \times \text{RBE}\bigl(\text{LET}(z + D_k)\bigr) \times \Delta t$$
+
+        where:
+        - $D_{\text{phys}}(z)$ = physical dose of the pristine Bragg peak at depth $z$
+        - $\text{LET}(z)$ = linear energy transfer at depth $z$
+        - $\text{RBE}(\text{LET})$ = relative biological effectiveness, looked up from the RBE table via cubic spline interpolation
+        - $z + D_k$ is the "look-up depth": the original Bragg peak position that, after shifting by $D_k$, contributes to depth $z$
+
+        **Physical interpretation**: At $t=0$, $D_0=0$, the pristine peak is at its deepest position (EndPoint). As $D_k$ increases, the peak moves to shallower depths, so depth $z$ receives dose from progressively deeper portions of the original peak.
+
+        #### (d) Physical SOBP Dose
+
+        Same as above but without the RBE weighting:
+
+        $$\text{SOBP}_{\text{phys}}(z) = \sum_{k=0}^{N} D_{\text{phys}}(z + D_k) \times \Delta t$$
+
+        #### (e) Objective Function
+
+        The optimization minimizes a uniformity metric of the biological dose within the platform region $[z_{\text{start}}, z_{\text{end}}]$. The available objective functions are:
+
+        **Standard Deviation (σ)** (default):
+
+        $$\min_{\{a_i\}} \; \text{Std}\Bigl[\text{SOBP}_{\text{bio}}(z) \Bigr]_{z \in [z_{\text{start}},\, z_{\text{end}}]}$$
+
+        **Coefficient of Variation (CV)** — normalized σ/μ, unitless:
+
+        $$\min_{\{a_i\}} \; \frac{\sigma}{\mu}$$
+
+        **Dose Homogeneity Index (DHI)** — clinical standard, penalizes worst-case spread:
+
+        $$\min_{\{a_i\}} \; \frac{D_{\max} - D_{\min}}{D_{\text{mean}}}$$
+
+        **Max Relative Deviation** — penalizes single worst outlier:
+
+        $$\min_{\{a_i\}} \; \frac{\max|D(z) - \mu|}{\mu}$$
+
+        **Percentile Uniformity** — robust to outliers, uses D₂ and D₉₈ instead of min/max:
+
+        $$\min_{\{a_i\}} \; \frac{D_{98} - D_{2}}{D_{50}}$$
+
+        **Combined (0.5·CV + 0.5·DHI)** — balances overall and worst-case:
+
+        $$\min_{\{a_i\}} \; 0.5 \cdot \frac{\sigma}{\mu} + 0.5 \cdot \frac{D_{\max} - D_{\min}}{D_{\text{mean}}}$$
+
+        All objective functions operate on the biological dose within $[z_{\text{start}}, z_{\text{end}}]$.
+
+        #### (f) Optimization Strategy
+
+        Four strategies are available:
+
+        - **Nelder-Mead (fast)**: Local simplex search. Fast but may find local minima. Good for quick exploration.
+        - **Multi-Start Restart**: Runs Nelder-Mead from multiple random initial points, keeps the best result. More robust than single-start.
+        - **Differential Evolution (global)**: Population-based global optimizer (`scipy.optimize.differential_evolution`). Searches the full parameter space $a_i \in [-10, 10]$ with bounds constraints. Slower but much less likely to miss the global optimum.
+        - **Two-Stage (global → local)**: Stage 1 uses Differential Evolution for global exploration, Stage 2 refines with Nelder-Mead. Best of both worlds — global coverage + local precision.
+
+        #### (g) Quarter-Circle Distance Reference
+
+        The idealized distance profile follows quarter-circle arcs:
+
+        $$D_{\text{ideal}}(\theta) = R \cdot \bigl|\sin(\theta)\bigr|$$
+
+        producing 2 symmetric peaks over $\theta \in [0, 2\pi]$, serving as a geometric reference for the optimized velocity-derived distance.
         """)
 
     with st.expander("5. 3D Visualization"):
