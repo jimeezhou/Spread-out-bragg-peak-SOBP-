@@ -62,6 +62,9 @@ A single pristine Bragg peak deposits maximum dose at a specific depth. By modul
 ### 3D Model
 ![3D Model](figures/Model.png)
 
+### Radiation Simulation
+![Simulation](figures/SOBP_simulation.gif)
+
 ---
 
 ## Quick Start
