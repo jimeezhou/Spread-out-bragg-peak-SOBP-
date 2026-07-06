@@ -50,6 +50,9 @@ A single pristine Bragg peak deposits maximum dose at a specific depth. By modul
 
 ## Screenshots
 
+### Bragg Peak & LET Profile
+![Bragg LET](figures/BraggLET.png)
+
 ### SOBP Dose Distribution
 ![SOBP Dose](figures/SOBP.png)
 
